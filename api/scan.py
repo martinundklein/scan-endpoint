@@ -1,138 +1,116 @@
 # scan.py
-import io, base64, json
-from typing import Optional, Literal
-
-import cv2, numpy as np
-from PIL import Image
+import io
+import os
+import base64
+import urllib.parse
 import httpx
-
-from fastapi import FastAPI, Request, File, UploadFile, HTTPException, Query, Response
+from PIL import Image, ImageOps
+import numpy as np
+import cv2  # opencv-python-headless
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
 
 app = FastAPI(title="Scan Endpoint")
 
-def deskew_and_binarize(img_bgr: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    # grobe Schiefstandskorrektur
-    coords = np.column_stack(np.where(gray > 0))
-    angle = 0.0
-    if coords.size:
-        rect = cv2.minAreaRect(coords)
-        angle = rect[-1]
-        angle = -(90 + angle) if angle < -45 else -angle
-    (h, w) = gray.shape[:2]
-    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-    rot = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    # “Scan”-Look
-    bw = cv2.adaptiveThreshold(rot, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY, 35, 15)
-    # Ränder weg
-    mask = bw < 250
-    if mask.any():
-        yx = np.argwhere(mask)
-        y0, x0 = yx.min(axis=0)
-        y1, x1 = yx.max(axis=0) + 1
-        bw = bw[y0:y1, x0:x1]
-    return bw
 
-async def _download(url: str) -> bytes:
-    async with httpx.AsyncClient(timeout=30) as client:
+async def download_to_bytes(url: str) -> bytes:
+    timeout = httpx.Timeout(30.0, read=60.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         r = await client.get(url)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise HTTPException(400, f"Could not download file_url (HTTP {r.status_code})")
         return r.content
+
+
+def deskew_and_crop(img_cv: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    h, w = gray.shape
+    best = None
+    best_area = 0
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            area = cv2.contourArea(approx)
+            if area > best_area:
+                best = approx.reshape(4, 2).astype(np.float32)
+                best_area = area
+
+    if best is not None and best_area > 0.1 * (w * h):
+        def order(pts):
+            s = pts.sum(axis=1)
+            diff = np.diff(pts, axis=1)
+            tl = pts[np.argmin(s)]
+            br = pts[np.argmax(s)]
+            tr = pts[np.argmin(diff)]
+            bl = pts[np.argmax(diff)]
+            return np.array([tl, tr, br, bl], dtype=np.float32)
+
+        quad = order(best)
+        widthA = np.linalg.norm(quad[2] - quad[3])
+        widthB = np.linalg.norm(quad[1] - quad[0])
+        heightA = np.linalg.norm(quad[1] - quad[2])
+        heightB = np.linalg.norm(quad[0] - quad[3])
+        maxW = int(max(widthA, widthB))
+        maxH = int(max(heightA, heightB))
+        dest = np.array([[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]], dtype=np.float32)
+        M = cv2.getPerspectiveTransform(quad, dest)
+        warped = cv2.warpPerspective(img_cv, M, (maxW, maxH))
+    else:
+        warped = img_cv
+
+    gray2 = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    thr = cv2.adaptiveThreshold(
+        gray2, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 35, 15
+    )
+    return thr
+
+
+def image_bytes_to_pdf_bytes(img_np: np.ndarray) -> bytes:
+    pil_img = Image.fromarray(img_np)
+    pil_img = ImageOps.invert(ImageOps.invert(pil_img))
+    buf = io.BytesIO()
+    pil_img.convert("L").save(buf, format="PDF", resolution=300.0)
+    return buf.getvalue()
+
+
+async def upload_temp_file(pdf_bytes: bytes, filename: str) -> str:
+    """Upload to transfer.sh and return public URL"""
+    async with httpx.AsyncClient() as client:
+        files = {filename: io.BytesIO(pdf_bytes)}
+        r = await client.post(f"https://transfer.sh/{filename}", content=pdf_bytes)
+        if r.status_code >= 400:
+            raise HTTPException(500, f"Upload failed ({r.status_code})")
+        return r.text.strip()
+
 
 @app.post("/scan")
 async def scan(
-    request: Request,
-    response: Literal["pdf", "json"] = Query("json"),
-    file: UploadFile | None = File(None),
+    file_url: str = Query(...),
 ):
-    # Body nur einmal lesen
-    raw = await request.body()
-    ctype = (request.headers.get("content-type") or "").lower()
+    if not file_url:
+        raise HTTPException(422, "file_url is required")
 
-    file_url: Optional[str] = None
-    file_b64: Optional[str] = None
+    raw = await download_to_bytes(file_url)
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    scanned = deskew_and_crop(cv_img)
+    pdf_bytes = image_bytes_to_pdf_bytes(scanned)
 
-    # 1) JSON?
-    if "application/json" in ctype or (raw.startswith(b"{") and b"}" in raw[:4096]):
-        try:
-            obj = json.loads(raw.decode("utf-8"))
-            file_url = obj.get("file_url") or obj.get("url") or obj.get("file-url")
-            file_b64 = obj.get("file_base64") or obj.get("fileBase64")
-        except Exception:
-            pass
+    filename = "scan.pdf"
+    public_url = await upload_temp_file(pdf_bytes, filename)
 
-    # 2) Form / multipart?
-    if not (file_url or file_b64 or file) and (
-        "multipart/form-data" in ctype or "application/x-www-form-urlencoded" in ctype
-    ):
-        try:
-            form = await request.form()
-            file_url = form.get("file_url") or form.get("url") or form.get("file-url")
-            file_b64 = form.get("file_base64") or form.get("fileBase64")
-        except Exception:
-            pass
+    return JSONResponse({
+        "filename": filename,
+        "url": public_url
+    })
 
-    # 3) Nur eine URL als Text?
-    if not (file_url or file_b64 or file):
-        text = raw.decode("utf-8", "ignore").strip()
-        if text.startswith("http"):
-            file_url = text
 
-    if not (file or file_url or file_b64):
-        raise HTTPException(status_code=422, detail="Provide a file or file_url")
-
-    # Bytes beschaffen
-    if file is not None:
-        data = await file.read()
-    elif file_b64:
-        data = base64.b64decode(file_b64.split(",")[-1])
-    else:
-        data = await _download(file_url)
-
-    # Bild dekodieren
-    arr = np.frombuffer(data, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Could not decode image")
-
-    scanned = deskew_and_binarize(img)
-
-    if response == "pdf":
-        # als PDF zurück
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.utils import ImageReader
-        from reportlab.lib.pagesizes import letter
-
-        rgb = cv2.cvtColor(scanned, cv2.COLOR_GRAY2RGB)
-        pil = Image.fromarray(rgb)
-        png = io.BytesIO()
-        pil.save(png, format="PNG")
-        png.seek(0)
-
-        page_w, page_h = letter
-        margin = 36
-        avail_w, avail_h = page_w - 2 * margin, page_h - 2 * margin
-        h_px, w_px = scanned.shape
-        scale = min(avail_w / w_px, avail_h / h_px)
-        draw_w, draw_h = w_px * scale, h_px * scale
-        x, y = (page_w - draw_w) / 2, (page_h - draw_h) / 2
-
-        out = io.BytesIO()
-        c = canvas.Canvas(out, pagesize=letter)
-        c.drawImage(ImageReader(png), x, y, width=draw_w, height=draw_h, mask="auto")
-        c.showPage()
-        c.save()
-        pdf = out.getvalue()
-        return Response(
-            content=pdf,
-            media_type="application/pdf",
-            headers={"Content-Disposition": "inline; filename=scan.pdf"},
-        )
-
-    # sonst Base64 (PNG) als JSON
-    ok, enc = cv2.imencode(".png", scanned)
-    if not ok:
-        raise HTTPException(status_code=500, detail="Encode failed")
-    b64 = base64.b64encode(enc.tobytes()).decode("ascii")
-    return {"filename": "scan.png", "content_type": "image/png", "file_base64": b64}
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    return "OK"
