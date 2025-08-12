@@ -1,252 +1,257 @@
-# api/scan.py
-from fastapi import FastAPI, HTTPException, Query, Response
-import httpx, io, math, os
-from typing import Tuple, Optional
-from PIL import Image, ImageOps
+import io
+import math
+from typing import Tuple, Optional, List
+
 import numpy as np
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import StreamingResponse, PlainTextResponse
+import httpx
+from PIL import Image
 import cv2 as cv
-from skimage.filters import threshold_sauvola
+
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
 from reportlab.lib.utils import ImageReader
 
-app = FastAPI(title="Receipt Scan Endpoint")
+app = FastAPI(title="Simple Receipt Scanner")
 
-# --------------------------
-# Hilfen
-# --------------------------
-async def fetch_bytes(url: str, timeout: float = 20.0) -> bytes:
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        r = await client.get(url)
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Download failed ({r.status_code})")
-        return r.content
 
-def to_pil(arr: np.ndarray) -> Image.Image:
-    if arr.ndim == 2:
-        return Image.fromarray(arr)
-    return Image.fromarray(cv.cvtColor(arr, cv.COLOR_BGR2RGB))
+# ---------- Helpers ----------
 
-def to_bgr(img: Image.Image) -> np.ndarray:
-    return cv.cvtColor(np.array(img), cv.COLOR_RGB2BGR)
+async def fetch_bytes(url: str, timeout: float = 30.0) -> bytes:
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout,
+                                     headers={"User-Agent": "scan-endpoint/1.0"}) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            return r.content
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Download fehlgeschlagen: {e}") from e
 
-def auto_deskew(gray: np.ndarray) -> np.ndarray:
-    # Kanten -> Hough-Linien -> Winkelmedian
+
+def load_bgr(img_bytes: bytes) -> np.ndarray:
+    data = np.frombuffer(img_bytes, dtype=np.uint8)
+    bgr = cv.imdecode(data, cv.IMREAD_COLOR)
+    if bgr is None:
+        raise HTTPException(status_code=415, detail="Bildformat wird nicht unterstützt.")
+    return bgr
+
+
+def to_gray(bgr: np.ndarray) -> np.ndarray:
+    return cv.cvtColor(bgr, cv.COLOR_BGR2GRAY)
+
+
+def adaptive_binarize(gray: np.ndarray) -> np.ndarray:
+    # sanft glätten, dann adaptive threshold (gaussian)
+    blur = cv.GaussianBlur(gray, (5, 5), 0)
+    bw = cv.adaptiveThreshold(
+        blur, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 31, 10
+    )
+    return bw
+
+
+def estimate_skew_angle(gray: np.ndarray) -> float:
+    """kleine Schätzung des Schiefwinkels in Grad (horizontaler Text)"""
     edges = cv.Canny(gray, 50, 150, apertureSize=3)
-    lines = cv.HoughLines(edges, 1, np.pi/180, threshold=120)
-    if lines is None or len(lines) < 3:
-        return gray
+    lines = cv.HoughLines(edges, 1, np.pi / 180.0, threshold=max(120, int(0.15 * gray.shape[1])))
+    if lines is None:
+        return 0.0
+    # Winkel um 0° sammeln (±15°)
     angles = []
-    for rho, theta in lines[:,0,:]:
-        ang = (theta * 180 / np.pi) - 90  # horizontale Linien -> 0
-        # nur fast-horizontale/vertikale Linien
-        if -45 <= ang <= 45:
-            angles.append(ang)
+    for rho_theta in lines[:200]:
+        rho, theta = rho_theta[0]
+        angle = (theta * 180.0 / np.pi) - 90.0  # 0≈horizontal
+        if -15.0 <= angle <= 15.0:
+            angles.append(angle)
     if not angles:
-        return gray
-    angle = float(np.median(angles))
-    (h, w) = gray.shape[:2]
-    M = cv.getRotationMatrix2D((w//2, h//2), angle, 1.0)
-    rotated = cv.warpAffine(gray, M, (w, h), flags=cv.INTER_CUBIC, borderMode=cv.BORDER_REPLICATE)
-    return rotated
+        return 0.0
+    return float(np.median(angles))
 
-def enhance(gray: np.ndarray) -> np.ndarray:
-    # milder Rauschfilter + CLAHE für Kontrast
-    den = cv.bilateralFilter(gray, d=5, sigmaColor=50, sigmaSpace=50)
-    clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    enh = clahe.apply(den)
-    return enh
 
-def try_find_receipt_contour(gray: np.ndarray) -> Tuple[Optional[np.ndarray], float]:
-    """
-    Sucht die größte viereckige Kontur, die KEIN fast-quadratisches Verhältnis hat.
-    Liefert (4x2 Punkte) im Uhrzeigersinn + Konfidenz [0..1].
-    QR-Codes werden i.d.R. durch quadratisches Verhältnis + kleine Fläche gefiltert.
-    """
-    h, w = gray.shape[:2]
-    area_img = w * h
+def rotate_keep_size(image: np.ndarray, angle_deg: float) -> np.ndarray:
+    if abs(angle_deg) < 0.3:
+        return image
+    h, w = image.shape[:2]
+    M = cv.getRotationMatrix2D((w / 2, h / 2), angle_deg, 1.0)
+    return cv.warpAffine(image, M, (w, h), flags=cv.INTER_CUBIC, borderMode=cv.BORDER_REPLICATE)
 
-    # Kanten für Konturen
-    blur = cv.GaussianBlur(gray, (5,5), 0)
-    edges = cv.Canny(blur, 60, 160)
 
-    # leichte Dilatation, damit Kanten schließen
-    edges = cv.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
+def order_corners(pts: np.ndarray) -> np.ndarray:
+    """ordnet vier Ecken: [tl, tr, br, bl]"""
+    pts = pts.reshape(4, 2)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).reshape(-1)
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmin(diff)]
+    bl = pts[np.argmax(diff)]
+    return np.array([tl, tr, br, bl], dtype=np.float32)
 
-    cnts, _ = cv.findContours(edges, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    best = None
-    best_score = 0.0
 
-    for c in cnts:
-        area = cv.contourArea(c)
-        if area < 0.08*area_img:  # zu klein
-            continue
-
-        peri = cv.arcLength(c, True)
-        approx = cv.approxPolyDP(c, 0.02*peri, True)
-        if len(approx) != 4:
-            continue
-
-        # Bounding-Box Verhältnis prüfen
-        rect = cv.minAreaRect(approx)
-        (bw, bh) = rect[1]
-        if bw == 0 or bh == 0:
-            continue
-        ratio = max(bw, bh) / (min(bw, bh) + 1e-6)
-
-        # QR-ähnliche Quadrate raus (ratio ~1) ODER sehr kleines Rechteck
-        if 0.90 <= ratio <= 1.10:
-            continue
-
-        # Score: Fläche*Geradheit
-        box = cv.boxPoints(rect)
-        box = np.int0(box)
-
-        # "Geradheit": wie gut approx der Kontur folgt
-        fill = area / (bw*bh + 1e-6)
-        score = (area/area_img) * 0.7 + min(fill, 1.0) * 0.3
-        if score > best_score:
-            best_score = score
-            best = approx.reshape(4,2).astype(np.float32)
-
-    if best is None:
-        return None, 0.0
-
-    # Ordnung der Punkte (tl,tr,br,bl)
-    def order_pts(pts):
-        s = pts.sum(axis=1)
-        diff = np.diff(pts, axis=1).ravel()
-        tl = pts[np.argmin(s)]
-        br = pts[np.argmax(s)]
-        tr = pts[np.argmin(diff)]
-        bl = pts[np.argmax(diff)]
-        return np.array([tl, tr, br, bl], dtype=np.float32)
-    best = order_pts(best)
-
-    # heuristische Konfidenz
-    conf = float(min(0.99, best_score))
-    return best, conf
-
-def four_point_warp(img: np.ndarray, pts: np.ndarray, out_width: int = 1200) -> np.ndarray:
-    (tl, tr, br, bl) = pts
-    # Zielgröße nach Seitenlängen
+def four_point_warp(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    tl, tr, br, bl = order_corners(pts)
     widthA = np.linalg.norm(br - bl)
     widthB = np.linalg.norm(tr - tl)
     heightA = np.linalg.norm(tr - br)
     heightB = np.linalg.norm(tl - bl)
     maxW = int(max(widthA, widthB))
     maxH = int(max(heightA, heightB))
-    if maxW < 10 or maxH < 10:
-        return img
+    dest = np.array([[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]], dtype=np.float32)
+    M = cv.getPerspectiveTransform(np.float32([tl, tr, br, bl]), dest)
+    return cv.warpPerspective(image, M, (maxW, maxH), flags=cv.INTER_CUBIC)
 
-    scale = out_width / maxW
-    outW = int(maxW * scale)
-    outH = int(maxH * scale)
 
-    dst = np.array([[0,0],[outW-1,0],[outW-1,outH-1],[0,outH-1]], dtype=np.float32)
-    M = cv.getPerspectiveTransform(pts, dst)
-    warped = cv.warpPerspective(img, M, (outW, outH), flags=cv.INTER_CUBIC)
-    return warped
+def contour_confidence(cnt: np.ndarray, img_area: float) -> Tuple[float, dict]:
+    area = cv.contourArea(cnt)
+    if area <= 0:
+        return 0.0, {}
+    x, y, w, h = cv.boundingRect(cnt)
+    aspect = h / max(w, 1)
+    area_ratio = area / img_area
+    rectangularity = area / (w * h + 1e-6)
 
-def bw_scan(img_rgb: Image.Image, strength: float = 0.6) -> Image.Image:
-    """
-    Milde B/W-Scan-Optik. strength: 0..1 (0=sehr mild, 1=hart)
-    """
-    bgr = to_bgr(img_rgb)
-    gray = cv.cvtColor(bgr, cv.COLOR_BGR2GRAY)
-    gray = enhance(gray)
-    # Sauvola adaptiv
-    win = 25
-    k = 0.2 + 0.2*strength  # 0.2..0.4
-    thresh = threshold_sauvola(gray, window_size=win, k=k)
-    bw = (gray > thresh).astype(np.uint8) * 255
+    score = 0.0
+    # groß genug?
+    if area_ratio > 0.20: score += 0.25
+    if area_ratio > 0.35: score += 0.20  # sehr gut
+    # länglich (Beleg) – QR-Codes (≈1:1) fallen raus
+    if aspect > 1.3: score += 0.25
+    if aspect > 1.8: score += 0.10
+    # rechteck-nah
+    if rectangularity > 0.75: score += 0.15
+    if rectangularity > 0.85: score += 0.05
 
-    # etwas Öffnen/Schließen gegen Salz&Pfeffer
-    kernel = np.ones((2,2), np.uint8)
-    bw = cv.morphologyEx(bw, cv.MORPH_OPEN, kernel, iterations=1)
-    bw = cv.morphologyEx(bw, cv.MORPH_CLOSE, kernel, iterations=1)
+    # vier Ecken?
+    peri = cv.arcLength(cnt, True)
+    approx = cv.approxPolyDP(cnt, 0.02 * peri, True)
+    if len(approx) == 4: score += 0.10
 
-    # leichte Mischung mit Graustufen, damit es nicht „kaputt-hart“ wirkt
-    alpha = 0.15 + 0.25*strength  # 0.15..0.40
-    mixed = cv.addWeighted(gray, 1-alpha, bw, alpha, 0)
-    return to_pil(mixed)
+    details = dict(area_ratio=float(area_ratio), aspect=float(aspect),
+                   rectangularity=float(rectangularity), approx_pts=int(len(approx)))
+    return score, details
 
-def make_pdf_from_image(img: Image.Image, dpi: int = 300) -> bytes:
-    # weißer Rand, dann als PNG in PDF
-    img = ImageOps.exif_transpose(img)
-    # Für ReportLab
-    png_buf = io.BytesIO()
-    img.save(png_buf, format="PNG", optimize=True)
-    png_buf.seek(0)
-    reader = ImageReader(png_buf)
 
-    # Seitenmaß in Punkten
-    w_px, h_px = img.size
-    w_pt = w_px / dpi * 72
-    h_pt = h_px / dpi * 72
+def detect_receipt(gray: np.ndarray) -> Tuple[Optional[np.ndarray], float, dict]:
+    """liefert ggf. 4-Punkte-Polygon (float32) + Score"""
+    img_area = float(gray.shape[0] * gray.shape[1])
 
-    pdf = io.BytesIO()
-    c = canvas.Canvas(pdf, pagesize=(w_pt, h_pt))
-    c.drawImage(reader, 0, 0, width=w_pt, height=h_pt, preserveAspectRatio=True, mask='auto')
+    # Kanten und Konturen
+    bw = adaptive_binarize(gray)
+    if np.mean(bw) < 127:  # invertiert? wir wollen Text schwarz
+        bw = 255 - bw
+    edges = cv.Canny(bw, 60, 180)
+    edges = cv.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+
+    contours, _ = cv.findContours(edges, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+    best_pts = None
+    best_score = 0.0
+    best_meta = {}
+    for cnt in contours:
+        score, meta = contour_confidence(cnt, img_area)
+        if score > best_score:
+            peri = cv.arcLength(cnt, True)
+            approx = cv.approxPolyDP(cnt, 0.02 * peri, True)
+            if len(approx) >= 4:
+                # nehme die 4 “besten” Ecken via minAreaRect/box
+                rect = cv.minAreaRect(cnt)
+                box = cv.boxPoints(rect).astype(np.float32)
+                best_pts = box
+                best_score = score
+                best_meta = meta
+
+    return best_pts, float(best_score), best_meta
+
+
+def to_pdf_bytes(pil_img: Image.Image) -> bytes:
+    # PNG in Ram
+    buf_png = io.BytesIO()
+    pil_img.save(buf_png, format="PNG", optimize=True)
+    buf_png.seek(0)
+
+    # PDF mit gleicher Größe in ~200 DPI (gute Lesbarkeit, kleine Datei)
+    dpi = 200
+    w_px, h_px = pil_img.size
+    w_in = w_px / dpi
+    h_in = h_px / dpi
+
+    buf_pdf = io.BytesIO()
+    c = canvas.Canvas(buf_pdf, pagesize=(w_in * inch, h_in * inch))
+    c.drawImage(ImageReader(buf_png), 0, 0, width=w_in * inch, height=h_in * inch, preserveAspectRatio=True, mask='auto')
     c.showPage()
     c.save()
-    pdf.seek(0)
-    return pdf.read()
+    buf_pdf.seek(0)
+    return buf_pdf.read()
 
-# --------------------------
-# API
-# --------------------------
-@app.get("/")
-def root():
-    return {"ok": True, "usage": "/scan?file_url=...&detect_conf=0.7&bw_strength=0.55"}
+
+# ---------- Pipeline ----------
+
+def process_image(bgr: np.ndarray, min_crop_conf: float = 0.7, bw_strength: float = 0.6) -> Image.Image:
+    """
+    - nur croppen/geradeziehen, wenn Sicherheit >= min_crop_conf
+    - sonst nur leicht deskew + B/W
+    """
+    # verkleinern für schnellere Konturerkennung (nicht fürs Endresultat!)
+    h, w = bgr.shape[:2]
+    scale = 1000.0 / max(h, w) if max(h, w) > 1400 else 1.0
+    small = cv.resize(bgr, (int(w * scale), int(h * scale)), interpolation=cv.INTER_AREA)
+    small_gray = to_gray(small)
+
+    # Kandidat finden
+    pts, score, _meta = detect_receipt(small_gray)
+
+    # in Originalkoordinaten mappen
+    warped = None
+    if pts is not None and score >= min_crop_conf:
+        pts_orig = (pts / scale).astype(np.float32)
+        warped = four_point_warp(bgr, pts_orig)
+
+    work = warped if warped is not None else bgr
+
+    # leichte Schiefstandkorrektur
+    gray = to_gray(work)
+    angle = estimate_skew_angle(gray)
+    work = rotate_keep_size(work, angle)
+
+    # zarte B/W-Optik
+    gray = to_gray(work)
+    bw = adaptive_binarize(gray)
+
+    # “Stärke” mischen: bw_strength in [0..1] mischt mit leichtem Kontrastbild
+    #  -> weicher, besser lesbar als hartes Schwarz/Weiß
+    clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    eq = clahe.apply(gray)
+    mixed = cv.addWeighted(eq, (1.0 - bw_strength), bw, bw_strength, 0)
+
+    # zurück zu PIL (RGB)
+    pil = Image.fromarray(mixed).convert("L")  # Graustufen-PDF ist kleiner
+    return pil
+
+
+# ---------- Routes ----------
+
+@app.get("/", response_class=PlainTextResponse)
+async def root():
+    return "OK - /scan?file_url=ENCODED_URL  (optional: min_conf, bw)"
+
 
 @app.get("/scan")
 async def scan(
-    file_url: str = Query(..., description="Öffentliche Bild-URL (Airtable File URL)"),
-    detect_conf: float = Query(0.70, ge=0.0, le=1.0, description="Konfidenzschwelle fürs Zuschneiden"),
-    bw_strength: float = Query(0.55, ge=0.0, le=1.0, description="Intensität der B/W-Optik 0..1"),
-    filename: str = Query("scan.pdf")
+    file_url: str = Query(..., description="Öffentliche Bild-URL (z.B. Airtable v5 URL)"),
+    min_conf: float = Query(0.70, ge=0.0, le=1.0, description="Mindest-Sicherheit fürs Zuschneiden"),
+    bw: float = Query(0.60, ge=0.0, le=1.0, description="B/W Intensität (0=weich, 1=hart)")
 ):
-    try:
-        raw = await fetch_bytes(file_url)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Download error: {e}")
+    """
+    Liefert direkt ein PDF (Content-Disposition: attachment; filename=scan.pdf)
+    """
+    img_bytes = await fetch_bytes(file_url)
+    bgr = load_bgr(img_bytes)
 
-    try:
-        img = Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception:
-        # falls PDF reinkommt -> erste Seite als Bild versuchen
-        raise HTTPException(status_code=415, detail="Unsupported file (expecting an image)")
+    pil = process_image(bgr, min_crop_conf=min_conf, bw_strength=bw)
+    pdf_bytes = to_pdf_bytes(pil)
 
-    # Nach EXIF ausrichten & auf sinnvolle Max-Kante skalieren
-    img = ImageOps.exif_transpose(img)
-    max_side = 2000
-    if max(img.size) > max_side:
-        img = img.copy()
-        img.thumbnail((max_side, max_side), Image.LANCZOS)
-
-    bgr = to_bgr(img)
-    gray = cv.cvtColor(bgr, cv.COLOR_BGR2GRAY)
-
-    # Deskew + Enhancement
-    gray = auto_deskew(gray)
-    gray = enhance(gray)
-
-    # Versuch: Beleg finden
-    quad, conf = try_find_receipt_contour(gray)
-
-    if quad is not None and conf >= detect_conf:
-        warped = four_point_warp(bgr, quad, out_width=1300)
-        gray2 = cv.cvtColor(warped, cv.COLOR_BGR2GRAY)
-        gray2 = enhance(gray2)
-        result_img = bw_scan(to_pil(gray2), strength=bw_strength)
-    else:
-        # kein sicherer Cut -> ganze Seite milde B/W
-        result_img = bw_scan(to_pil(gray), strength=bw_strength)
-
-    pdf_bytes = make_pdf_from_image(result_img, dpi=300)
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "Content-Type": "application/pdf",
-    }
-    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="scan.pdf"'}
+    )
