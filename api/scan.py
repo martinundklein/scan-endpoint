@@ -1,311 +1,233 @@
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import Response, JSONResponse
-import asyncio
-import httpx
+# api/scan.py
 import io
 import math
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
-import cv2
 import numpy as np
+import cv2
+import httpx
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import Response, PlainTextResponse
 from PIL import Image
-
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4, portrait
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 
-app = FastAPI(title="Receipt Scan", version="1.0.0")
+app = FastAPI(title="Receipt Scan Endpoint")
 
-# --------- Helfer ---------
+# ---------- helpers ----------
 
-async def fetch_image(url: str, timeout: float = 20.0) -> Image.Image:
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        r = await client.get(url)
-        if r.status_code != 200:
-            raise HTTPException(400, f"file_url fetch failed: {r.status_code}")
-        data = r.content
-    try:
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-    except Exception as e:
-        raise HTTPException(400, f"cannot open image: {e}")
-    return img
+def to_np(img: Image.Image) -> np.ndarray:
+    arr = np.array(img.convert("RGB"))
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
+def to_pil(bgr: np.ndarray) -> Image.Image:
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb)
 
-def pil_to_cv(img: Image.Image) -> np.ndarray:
-    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-
-def cv_to_pil(arr: np.ndarray) -> Image.Image:
-    return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
-
-
-def resize_max(img: np.ndarray, max_side: int = 1600) -> Tuple[np.ndarray, float]:
-    h, w = img.shape[:2]
+def resize_for_process(bgr: np.ndarray, max_side: int = 2000) -> Tuple[np.ndarray, float]:
+    h, w = bgr.shape[:2]
     scale = 1.0
     if max(h, w) > max_side:
         scale = max_side / float(max(h, w))
-        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-    return img, scale
+        bgr = cv2.resize(bgr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+    return bgr, scale
 
+def detect_qr_like_masks(gray: np.ndarray) -> np.ndarray:
+    """Erkennt große fast-quadratische Blöcke (QR/Datamatrix) und maskiert sie weg."""
+    h, w = gray.shape
+    mask = np.zeros_like(gray, dtype=np.uint8)
+    thr = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU)[1]
+    cnts, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < (h*w)*0.01:  # zu klein -> ignorieren
+            continue
+        x, y, bw, bh = cv2.boundingRect(c)
+        ratio = bw / float(bh + 1e-6)
+        fill = area / float(bw*bh + 1e-6)
+        # quadratisch + dicht gefüllt => sehr wahrscheinlich QR-Code
+        if 0.8 <= ratio <= 1.25 and fill > 0.6:
+            cv2.drawContours(mask, [c], -1, 255, -1)
+    return mask
 
-def order_quad(pts: np.ndarray) -> np.ndarray:
-    # ordnet 4 Punkte für perspectiveTransform
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # tl
-    rect[2] = pts[np.argmax(s)]  # br
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # tr
-    rect[3] = pts[np.argmax(diff)]  # bl
-    return rect
-
-
-def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    rect = order_quad(pts)
-    (tl, tr, br, bl) = rect
-    widthA = np.linalg.norm(br - bl)
-    widthB = np.linalg.norm(tr - tl)
-    maxWidth = int(max(widthA, widthB))
-    heightA = np.linalg.norm(tr - br)
-    heightB = np.linalg.norm(tl - bl)
-    maxHeight = int(max(heightA, heightB))
-
-    maxWidth = max(maxWidth, 100)
-    maxHeight = max(maxHeight, 100)
-
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]
-    ], dtype="float32")
-
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_CUBIC)
-    return warped
-
-
-def score_receipt_contour(cnt: np.ndarray, img_area: float) -> float:
-    # Score: groß, länglich (kein Quadrat), Vierpunkte-Approx gut
-    peri = cv2.arcLength(cnt, True)
-    approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-
-    # reject keine 4 Punkte
-    if len(approx) != 4:
-        return -1.0
-
-    x, y, w, h = cv2.boundingRect(approx)
-    if w <= 0 or h <= 0:
-        return -1.0
-
-    aspect = max(w, h) / (min(w, h) + 1e-6)
-    # QR‑Codes sind meist ~quadratisch => raus, wenn zu quadratisch
-    if 0.85 <= (w / (h + 1e-6)) <= 1.15:
-        return -1.0
-
-    area = cv2.contourArea(approx)
-    area_ratio = float(area) / float(img_area)
-
-    # Längliches Verhältnis bevorteilen
-    elong = min(aspect / 2.0, 1.0)  # cap bei 1
-    # Score kombinieren
-    score = 0.65 * area_ratio + 0.35 * elong
-    return score
-
-
-def try_detect_receipt(image: np.ndarray, conf_threshold: float = 0.70) -> Tuple[Optional[np.ndarray], float]:
-    work, scale = resize_max(image, 1400)
-    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
-
-    # leichte Glättung gegen Teppichrauschen
-    gray = cv2.bilateralFilter(gray, 7, 50, 50)
-
+def doc_candidate(gray: np.ndarray) -> Tuple[Optional[np.ndarray], float]:
+    """liefert beste 4‑Punkt‑Kontur und eine rohe Güte."""
+    h, w = gray.shape
+    # leicht glätten
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
     # Kanten
-    edges = cv2.Canny(gray, 40, 120)
-    # schließen, um Lücken zu reduzieren
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
-    edges = cv2.dilate(edges, kernel, iterations=1)
+    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
+
+    # QR‑ähnliche Bereiche entfernen
+    qr_mask = detect_qr_like_masks(gray)
+    edges = cv2.bitwise_and(edges, cv2.bitwise_not(qr_mask))
 
     cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    img_area = work.shape[0] * work.shape[1]
-
     best = None
-    best_score = -1.0
+    best_score = 0.0
+    img_area = float(h*w)
+
     for c in cnts:
-        score = score_receipt_contour(c, img_area)
+        area = cv2.contourArea(c)
+        if area < img_area * 0.05:
+            continue
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02*peri, True)
+        rect = cv2.minAreaRect(c)
+        box = cv2.boxPoints(rect)
+        box = np.int0(box)
+
+        # Rechteck‑Güte via 4 Ecken
+        if len(approx) == 4:
+            pts = approx.reshape(-1, 2)
+        else:
+            pts = box.reshape(-1, 2)
+
+        # Ordnung: top-left, top-right, bottom-right, bottom-left
+        s = pts.sum(axis=1)
+        diff = np.diff(pts, axis=1).ravel()
+        ordered = np.array([
+            pts[np.argmin(s)],
+            pts[np.argmin(diff)],
+            pts[np.argmax(s)],
+            pts[np.argmax(diff)]
+        ], dtype=np.float32)
+
+        # Metrics
+        rect_area = cv2.contourArea(ordered)
+        if rect_area <= 0:
+            continue
+        solidity = area / (rect_area + 1e-6)
+        fill = area / img_area
+        # Kontrast in dieser Region
+        mask = np.zeros_like(gray)
+        cv2.fillConvexPoly(mask, ordered.astype(np.int32), 255)
+        roi = cv2.bitwise_and(gray, gray, mask=mask)
+        cstd = float(np.std(roi[mask==255]))  # grober Kontrast
+
+        score = (min(fill/0.7,1.0) * 0.45) + (min(solidity,1.0) * 0.35) + (min(cstd/30.0,1.0) * 0.20)
+
         if score > best_score:
             best_score = score
-            best = c
+            best = ordered
 
-    if best is None or best_score < conf_threshold:
-        return None, best_score
+    return (best if best is not None else None, float(best_score))
 
-    peri = cv2.arcLength(best, True)
-    approx = cv2.approxPolyDP(best, 0.02 * peri, True)
-    approx = approx.reshape(-1, 2).astype("float32")
+def four_point_warp(bgr: np.ndarray, pts: np.ndarray, pad: int = 12) -> np.ndarray:
+    (tl, tr, br, bl) = pts.astype(np.float32)
+    def dist(a,b): return np.linalg.norm(a-b)
+    wA = dist(br, bl)
+    wB = dist(tr, tl)
+    hA = dist(tr, br)
+    hB = dist(tl, bl)
+    maxW = int(max(wA, wB))
+    maxH = int(max(hA, hB))
+    dst = np.array([[0,0],[maxW-1,0],[maxW-1,maxH-1],[0,maxH-1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(pts, dst)
+    warped = cv2.warpPerspective(bgr, M, (maxW, maxH), flags=cv2.INTER_CUBIC)
+    # leichter Rand
+    warped = cv2.copyMakeBorder(warped, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(255,255,255))
+    return warped
 
-    warped = four_point_transform(work, approx)
-    # zurück zur ursprünglichen Auflösung hochskalieren
-    if scale != 1.0:
-        inv = 1.0 / scale
-        warped = cv2.resize(
-            warped,
-            (int(warped.shape[1] * inv), int(warped.shape[0] * inv)),
-            interpolation=cv2.INTER_CUBIC,
-        )
-    return warped, best_score
+def enhance_bw(bgr: np.ndarray, strength: float = 0.6) -> np.ndarray:
+    """CLAHE + adaptives B/W + sanftes Schärfen. Stärke 0..1"""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    # CLAHE
+    clip = 2.0 + 2.0*strength
+    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8,8))
+    g = clahe.apply(gray)
+    # adaptives Threshold
+    block = int(21 + strength*20)  # 21..41
+    if block % 2 == 0:
+        block += 1
+    bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, block, 10)
+    # milde Entzerrung Helligkeit
+    bw = cv2.medianBlur(bw, 3)
+    # leicht schärfen
+    if strength > 0:
+        k = 0.5 + 0.8*strength  # 0.5..1.3
+        blurred = cv2.GaussianBlur(bw, (0,0), 1.0)
+        sharp = cv2.addWeighted(bw, 1+k, blurred, -k, 0)
+        bw = sharp
+    return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
 
+def portrait_rotate(bgr: np.ndarray) -> np.ndarray:
+    h, w = bgr.shape[:2]
+    return bgr if h >= w else cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
 
-def to_soft_bw(image: np.ndarray, strength: float = 0.35) -> np.ndarray:
-    """Sanftes S/W: (CLAHE + adaptives Threshold) mit Blend."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Kontrast lokal anheben
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray_eq = clahe.apply(gray)
-
-    # adaptives Threshold (nicht zu hart)
-    thr = cv2.adaptiveThreshold(
-        gray_eq, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 10
-    )
-    # In ein 3‑Kanal-Bild
-    thr_color = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
-    gray_color = cv2.cvtColor(gray_eq, cv2.COLOR_GRAY2BGR)
-
-    # sanft blenden (strength steuert "Scannigkeit")
-    out = cv2.addWeighted(gray_color, 1.0 - strength, thr_color, strength, 0)
-    return out
-
-
-def ensure_portrait(image: np.ndarray) -> np.ndarray:
-    h, w = image.shape[:2]
-    # Belege sind fast immer hochkant
-    if w > h:
-        image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    return image
-
-
-def image_to_pdf_bytes(img_bgr: np.ndarray) -> bytes:
-    img_bgr = ensure_portrait(img_bgr)
-
-    # als PNG in RAM
-    ok, buf = cv2.imencode(".png", img_bgr)
-    if not ok:
-        raise RuntimeError("PNG encode failed")
-    png_bytes = io.BytesIO(buf.tobytes())
-
-    # PDF bauen
-    packet = io.BytesIO()
-    # Seite: A4 Portrait
-    c = canvas.Canvas(packet, pagesize=portrait(A4))
-    page_w, page_h = portrait(A4)
-
-    # Bildabmessungen
-    pil_img = Image.open(io.BytesIO(png_bytes.getvalue()))
-    iw, ih = pil_img.size
-    aspect = iw / ih
-
-    # mit Rändern
-    margin = 24  # pt
-    max_w = page_w - 2 * margin
-    max_h = page_h - 2 * margin
-
-    # skaliere so, dass alles drauf passt
-    if max_w / max_h < aspect:
-        out_w = max_w
-        out_h = out_w / aspect
-    else:
-        out_h = max_h
-        out_w = out_h * aspect
-
-    x = (page_w - out_w) / 2
-    y = (page_h - out_h) / 2
-
-    c.drawImage(ImageReader(io.BytesIO(png_bytes.getvalue())),
-                x, y, width=out_w, height=out_h, preserveAspectRatio=True, mask='auto')
+def make_pdf_bytes(img: Image.Image) -> bytes:
+    # Seite = A4 hoch
+    page_w, page_h = A4
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    # Bild als temporärer ImageReader aus Bytes
+    bio = io.BytesIO()
+    img.save(bio, format="PNG")
+    bio.seek(0)
+    ir = ImageReader(bio)
+    iw, ih = img.size
+    # proportional einpassen mit Rand
+    margin = 24
+    max_w = page_w - 2*margin
+    max_h = page_h - 2*margin
+    scale = min(max_w/iw, max_h/ih)
+    ow, oh = iw*scale, ih*scale
+    x = (page_w - ow)/2
+    y = (page_h - oh)/2
+    c.drawImage(ir, x, y, ow, oh, preserveAspectRatio=True, mask='auto')
     c.showPage()
     c.save()
-    return packet.getvalue()
+    return buf.getvalue()
 
+# ---------- endpoint ----------
 
-async def upload_fallback(pdf_bytes: bytes, filename: str = "scan.pdf") -> str:
-    """
-    Nur falls du ?response=link nutzt. Probiert file.io, dann tmpfiles.org.
-    """
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        # 1) file.io
-        try:
-            files = {"file": (filename, pdf_bytes, "application/pdf")}
-            r = await client.post("https://file.io", files=files)
-            if r.status_code == 200:
-                j = r.json()
-                if j.get("success") and j.get("link"):
-                    return j["link"]
-        except Exception:
-            pass
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    return "OK – use /scan?file_url=...&crop_conf=0.70&enhance=0.55"
 
-        # 2) tmpfiles.org API
-        try:
-            files = {"file": (filename, pdf_bytes, "application/pdf")}
-            r = await client.post("https://tmpfiles.org/api/v1/upload", files=files)
-            if r.status_code == 200:
-                j = r.json()
-                link = j.get("data", {}).get("url")
-                if link:
-                    # Direktlink zur Datei (nicht nur Seite)
-                    # tmpfiles liefert Seite + Pfad; der direkte Link ist oft identisch
-                    return link
-        except Exception:
-            pass
-
-    raise HTTPException(502, "upload failed")
-
-
-# --------- API ---------
-
-@app.get("/", tags=["meta"])
-async def root():
-    return {"ok": True, "service": "receipt-scan", "version": "1.0.0"}
-
-
-@app.get("/scan", tags=["scan"])
+@app.get("/scan")
 async def scan(
-    file_url: str = Query(..., description="Öffentlich abrufbare Bild-URL (Airtable Attachment URL)"),
-    response: str = Query("pdf", pattern="^(pdf|link)$", description="pdf=PDF direkt, link=Upload-Link"),
-    conf: float = Query(0.70, ge=0.0, le=0.99, description="Schwellenwert für Zuschneiden/Entzerren"),
-    strength: float = Query(0.35, ge=0.15, le=0.6, description="Intensität der S/W-Optik")
-):
-    """
-    Holt ein Foto, versucht den Beleg zu erkennen (QR-Codes werden verworfen),
-    entzerrt nur bei ausreichender Sicherheit (>= conf),
-    sonst nur S/W-Optik. Gibt standardmäßig ein PDF zurück.
-    """
-    pil_img = await fetch_image(file_url)
-    bgr = pil_to_cv(pil_img)
-
-    # 1) Belegsuche
-    warped, score = try_detect_receipt(bgr, conf_threshold=conf)
-
-    if warped is None:
-        work = bgr.copy()  # kein sicherer Beleg -> nicht beschneiden
-    else:
-        work = warped
-
-    # 2) sanftes S/W (weniger hart)
-    processed = to_soft_bw(work, strength=strength)
-
-    # 3) PDF
+    file_url: str = Query(..., description="Öffentliche Bild-URL (Airtable CDN etc.)"),
+    crop_conf: float = Query(0.70, ge=0.0, le=1.0, description="Schwellwert für Cropping/Perspektive"),
+    enhance: float = Query(0.55, ge=0.0, le=1.0, description="Stärke der B/W‑Aufbereitung (0..1)"),
+) -> Response:
+    # Bild laden
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(file_url, follow_redirects=True)
+    if r.status_code != 200:
+        raise HTTPException(400, f"Bild-Download fehlgeschlagen ({r.status_code})")
     try:
-        pdf_bytes = image_to_pdf_bytes(processed)
+        img = Image.open(io.BytesIO(r.content))
     except Exception as e:
-        raise HTTPException(500, f"pdf build failed: {e}")
+        raise HTTPException(400, f"Ungültiges Bild: {e}")
 
-    if response == "link":
-        url = await upload_fallback(pdf_bytes, "scan.pdf")
-        return JSONResponse({"url": url, "crop_confidence": round(max(score, 0.0), 3)})
+    bgr = to_np(img)
+    bgr = portrait_rotate(bgr)
+    bgr_small, scale = resize_for_process(bgr, 1800)
+
+    gray = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2GRAY)
+    pts, score = doc_candidate(gray)
+
+    if pts is not None and score >= crop_conf:
+        warped = four_point_warp(bgr_small, pts)
+        # zurück auf „Original“‑Größe hochrechnen, aber capped
+        warped = resize_for_process(warped, 2200)[0]
+        work = enhance_bw(warped, strength=enhance)
     else:
-        headers = {
-            "Content-Disposition": 'inline; filename="scan.pdf"'
-        }
-        return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+        # Fallback: kein aggressives Cropping
+        work = enhance_bw(bgr_small, strength=max(0.35, enhance*0.8))
+
+    # PDF erzeugen
+    pdf_img = to_pil(work)
+    pdf_bytes = make_pdf_bytes(pdf_img)
+
+    headers = {
+        "Content-Type": "application/pdf",
+        "Content-Disposition": 'inline; filename="scan.pdf"',
+        "X-Scan-Decision": ("crop" if (pts is not None and score >= crop_conf) else "no-crop"),
+        "X-Scan-Score": f"{score:.3f}",
+    }
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
