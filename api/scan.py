@@ -1,199 +1,99 @@
-import io
-import math
-from typing import Optional
-
-import httpx
+from fastapi import FastAPI, Query
+from fastapi.responses import StreamingResponse
+import requests
+import cv2 as cv
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query, Response
-from PIL import Image, ImageOps
-import cv2
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import ImageReader
+from io import BytesIO
+from PIL import Image
+import tempfile
 
-app = FastAPI(title="Receipt Scan API (safe mode)")
+app = FastAPI()
 
-# ---------- Helpers ----------
+def download_image(url):
+    resp = requests.get(url)
+    resp.raise_for_status()
+    arr = np.frombuffer(resp.content, np.uint8)
+    img = cv.imdecode(arr, cv.IMREAD_COLOR)
+    return img
 
-async def fetch_image_bytes(url: str) -> bytes:
-    timeout = httpx.Timeout(30.0, connect=15.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.get(url, follow_redirects=True)
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Download failed: {r.status_code}")
-        return r.content
+def detect_document_edges(image, min_confidence=0.7):
+    gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+    blur = cv.GaussianBlur(gray, (5, 5), 0)
+    edges = cv.Canny(blur, 50, 150)
 
-def pil_from_bytes(b: bytes) -> Image.Image:
-    img = Image.open(io.BytesIO(b))
-    # Immer nach RGB konvertieren, einige JPEGs kommen als “L”/“P”
-    return img.convert("RGB")
+    contours, _ = cv.findContours(edges, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv.contourArea, reverse=True)[:5]
 
-def to_cv(img: Image.Image) -> np.ndarray:
-    # PIL RGB -> OpenCV BGR
-    arr = np.array(img)
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    for cnt in contours:
+        peri = cv.arcLength(cnt, True)
+        approx = cv.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) == 4:
+            area = cv.contourArea(approx)
+            image_area = image.shape[0] * image.shape[1]
+            confidence = area / image_area
+            if confidence > min_confidence:
+                return approx.reshape(4, 2)
 
-def to_pil(arr_bgr: np.ndarray) -> Image.Image:
-    rgb = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb)
+    return None
 
-def deskew_soft(gray: np.ndarray, max_angle: float = 5.0) -> np.ndarray:
-    """
-    Sanftes Begradigen: schätzt kleinen Schräglauf in [-max_angle, max_angle] Grad.
-    Schneidet NICHT, füllt Ränder weiß.
-    """
-    # Leichte Kantenverstärkung
-    edges = cv2.Canny(gray, 60, 180, apertureSize=3, L2gradient=True)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=120)
+def order_points(pts):
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
 
-    if lines is None or len(lines) == 0:
-        return gray
+def four_point_transform(image, pts):
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
 
-    # Winkel sammeln (in Grad), Linien nahe 0° bzw. 90° berücksichtigen
-    angles = []
-    for rho_theta in lines:
-        rho, theta = rho_theta[0]
-        # Normiere auf [-90, 90)
-        angle = (theta * 180.0 / np.pi) - 90.0
-        # Auf Nähe zu 0° oder 90° bringen
-        if angle < -45:
-            angle += 90
-        if angle > 45:
-            angle -= 90
-        angles.append(angle)
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    maxWidth = max(int(widthA), int(widthB))
 
-    if not angles:
-        return gray
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxHeight = max(int(heightA), int(heightB))
 
-    # Robust: Median statt Mittelwert
-    med = float(np.median(angles))
-    if abs(med) > max_angle:
-        # Sicherheit: nicht stärker als max_angle drehen
-        med = max(-max_angle, min(max_angle, med))
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]], dtype="float32")
 
-    if abs(med) < 0.2:
-        return gray  # praktisch gerade
+    M = cv.getPerspectiveTransform(rect, dst)
+    warped = cv.warpPerspective(image, M, (maxWidth, maxHeight))
+    return warped
 
-    h, w = gray.shape[:2]
-    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), med, 1.0)
-    rotated = cv2.warpAffine(
-        gray, M, (w, h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=255  # Weiß auffüllen
-    )
-    return rotated
+def apply_scan_effect(image):
+    gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+    # adaptive threshold for "scan" look
+    bw = cv.adaptiveThreshold(gray, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+                              cv.THRESH_BINARY, 25, 15)
+    # leicht weichzeichnen, um harte Kanten zu glätten
+    bw = cv.medianBlur(bw, 3)
+    return bw
 
-def bw_scan_safe(img: Image.Image, strength: float = 0.6) -> Image.Image:
-    """
-    'Scan'-Look ohne Zuschneiden/Perspektive.
-    Schritte:
-      - sanftes Denoise
-      - CLAHE Kontrast
-      - adaptives Thresholding (schonend)
-    strength in [0..1]: 0 = weich, 1 = knackig
-    """
-    bgr = to_cv(img)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+@app.get("/scan")
+def scan(file_url: str = Query(...)):
+    img = download_image(file_url)
 
-    # Sanftes Denoising (Detail erhalten)
-    gray = cv2.bilateralFilter(gray, d=5, sigmaColor=50, sigmaSpace=50)
+    # Versuche Begradigung
+    pts = detect_document_edges(img, min_confidence=0.7)
+    if pts is not None:
+        img = four_point_transform(img, pts)
 
-    # Sanftes Begradigen, begrenze Winkel
-    gray = deskew_soft(gray, max_angle=4.0)
+    # Scan-Look anwenden
+    scanned = apply_scan_effect(img)
 
-    # Kontrast (CLAHE)
-    # Clip-Limit je nach Stärke
-    clip = 2.0 + 2.0 * float(strength)  # 2.0..4.0
-    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
+    # zurück als PDF
+    pil_img = Image.fromarray(scanned)
+    pdf_bytes = BytesIO()
+    pil_img.save(pdf_bytes, format="PDF")
+    pdf_bytes.seek(0)
 
-    # Adaptives Thresholding (Gaussian) – blockSize odd, C fein abstimmen
-    block = int(21 + 10 * strength)  # 21..31
-    if block % 2 == 0:
-        block += 1
-    C = int(8 + 6 * strength)        # 8..14
-
-    bw = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        blockSize=block,
-        C=C
-    )
-
-    # leichte Öffnung, um “Salz” zu reduzieren – sehr mild
-    kernel = np.ones((2, 2), np.uint8)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    # Zurück nach PIL (als 1-Kanal Bild), dann zu RGB/“weiß” Hintergrund
-    pil_bw = Image.fromarray(bw, mode="L")
-    # Ein bisschen weicher: leichtes Minimum an Anti-Alias für PDF
-    pil_bw = ImageOps.autocontrast(pil_bw, cutoff=0)
-    return pil_bw.convert("RGB")
-
-def pdf_from_pil(img: Image.Image) -> bytes:
-    """
-    Legt das Bild ohne Zuschneiden auf eine A4-Seite, skaliert mit Erhalt des Seitenverhältnisses.
-    """
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    page_w, page_h = A4
-
-    # PIL -> bytes für ReportLab
-    img_buf = io.BytesIO()
-    img.save(img_buf, format="PNG")
-    img_buf.seek(0)
-    rl_img = ImageReader(img_buf)
-
-    # Zielgröße berechnen (mit Rändern)
-    margin = 20  # Punkte
-    max_w = page_w - 2 * margin
-    max_h = page_h - 2 * margin
-
-    iw, ih = img.size
-    scale = min(max_w / iw, max_h / ih)
-    out_w = iw * scale
-    out_h = ih * scale
-
-    x = (page_w - out_w) / 2
-    y = (page_h - out_h) / 2
-
-    c.drawImage(rl_img, x, y, width=out_w, height=out_h, preserveAspectRatio=True, mask='auto')
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-# ---------- Routes ----------
-
-@app.get("/", summary="Health")
-async def root():
-    return {"ok": True, "service": "receipt-scan-safe", "version": "1.0.0"}
-
-@app.get(
-    "/scan",
-    summary="Erzeuge Scan-PDF (safe)",
-    response_class=Response
-)
-async def scan(
-    file_url: str = Query(..., description="Direkt-URL zum Bild (JPG/PNG)"),
-    strength: float = Query(0.6, ge=0.0, le=1.0, description="Scan-Intensität 0..1 (Standard 0.6)")
-):
-    """
-    Holt ein Bild per URL, wendet sanften Scan-Look an (ohne Cropping/Perspektive),
-    und liefert ein A4-PDF (application/pdf) zurück.
-    """
-    try:
-        raw = await fetch_image_bytes(file_url)
-        pil = pil_from_bytes(raw)
-        scanned = bw_scan_safe(pil, strength=strength)
-        pdf_bytes = pdf_from_pil(scanned)
-        # Direkt als Datei ausliefern, damit Zapier den Binary-Body bekommt
-        headers = {
-            "Content-Disposition": 'inline; filename="scan.pdf"'
-        }
-        return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"processing error: {e}")
+    return StreamingResponse(pdf_bytes, media_type="application/pdf",
+                              headers={"Content-Disposition": "inline; filename=scan.pdf"})
