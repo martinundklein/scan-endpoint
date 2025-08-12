@@ -1,232 +1,264 @@
-import io
-import uuid
-import math
-import httpx
-import numpy as np
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse, PlainTextResponse
-from PIL import Image, ImageOps, ImageEnhance, ImageStat, ImageFilter, ExifTags
+import httpx
+import io
+import math
+import numpy as np
+from PIL import Image
+import cv2
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import portrait
 from reportlab.lib.utils import ImageReader
 
-# OpenCV optional (für Render: opencv-python-headless in requirements.txt)
-try:
-    import cv2
-    HAS_CV2 = True
-except Exception:
-    HAS_CV2 = False
+app = FastAPI(title="scan-endpoint")
 
-app = FastAPI(title="Scan API", description="Scan: straighten, crop, binarize → PDF", version="2.0")
+# ------------------------- Utils -------------------------
 
-# ------------------------------------------------------------
-# HTTP / MIME
-# ------------------------------------------------------------
-
-async def fetch_bytes(url: str):
-    async with httpx.AsyncClient(timeout=60) as client:
+async def fetch_image_bytes(url: str, timeout_s: float = 20.0) -> bytes:
+    async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True) as client:
         r = await client.get(url)
-        r.raise_for_status()
-        return r.content, r.headers.get("content-type", "")
+        if r.status_code != 200 or not r.content:
+            raise HTTPException(status_code=400, detail=f"Bilddownload fehlgeschlagen ({r.status_code}).")
+        return r.content
 
-def looks_like_pdf(ctype: str, data: bytes) -> bool:
-    return (ctype and "pdf" in ctype.lower()) or data.startswith(b"%PDF")
+def pil_to_cv2(img: Image.Image) -> np.ndarray:
+    if img.mode not in ("RGB", "L", "RGBA"):
+        img = img.convert("RGB")
+    arr = np.array(img)
+    if img.mode == "RGB":
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    if img.mode == "RGBA":
+        return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+    return arr  # L (grau)
 
-# ------------------------------------------------------------
-# PIL Utilities
-# ------------------------------------------------------------
+def ensure_max_side(mat: np.ndarray, max_side: int = 2200) -> np.ndarray:
+    h, w = mat.shape[:2]
+    s = max(h, w)
+    if s <= max_side:
+        return mat
+    scale = max_side / float(s)
+    return cv2.resize(mat, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
 
-def exif_transpose(img: Image.Image) -> Image.Image:
-    # Korrigiert iPhone/Android Rotationsflag
-    try:
-        return ImageOps.exif_transpose(img)
-    except Exception:
-        return img
+def mask_qr(mat_bgr: np.ndarray) -> np.ndarray:
+    # QR erkennen und weiß übermalen
+    qr = cv2.QRCodeDetector()
+    # detectAndDecode liefert bbox als 4 Punkte (1x4x2)
+    data, points, _ = qr.detectAndDecode(mat_bgr)
+    out = mat_bgr.copy()
+    if points is not None and len(points) > 0:
+        pts = points[0].astype(np.int32)
+        x, y, w, h = cv2.boundingRect(pts)
+        # etwas Puffer um den QR-Code
+        pad = int(0.08 * max(w, h))
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(out.shape[1], x + w + pad)
+        y1 = min(out.shape[0], y + h + pad)
+        out[y0:y1, x0:x1] = 255  # weiß füllen
+    return out
 
-def enhance_and_binarize_pil(img: Image.Image) -> Image.Image:
-    """Einfacher Fallback: Kontrast hoch, dann Otsu-ähnlich per Mittelwert."""
-    gray = ImageOps.grayscale(img)
-    gray = ImageEnhance.Contrast(gray).enhance(2.0)
-    arr = np.array(gray)
-    thresh = arr.mean()
-    bw = (arr > thresh).astype(np.uint8) * 255
-    return Image.fromarray(bw)
+def find_doc_quad(mat_gray: np.ndarray) -> np.ndarray | None:
+    # Canny + Konturen → größtes 4‑Punkt‑Polygon
+    blur = cv2.GaussianBlur(mat_gray, (5,5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
 
-# ------------------------------------------------------------
-# OpenCV: Dokument finden, entzerren, binarisieren, crop
-# ------------------------------------------------------------
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
 
-def order_pts(pts):
-    # Sortiert 4 Punkte in Reihenfolge: TL, TR, BR, BL
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # top-left
-    rect[2] = pts[np.argmax(s)]  # bottom-right
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # top-right
-    rect[3] = pts[np.argmax(diff)]  # bottom-left
-    return rect
+    h, w = mat_gray.shape[:2]
+    best = None
+    best_area = 0
 
-def four_point_transform(image, pts):
-    rect = order_pts(pts)
-    (tl, tr, br, bl) = rect
-    # Zielbreite/-höhe
-    widthA = np.linalg.norm(br - bl)
-    widthB = np.linalg.norm(tr - tl)
-    maxW = int(max(widthA, widthB))
-    heightA = np.linalg.norm(tr - br)
-    heightB = np.linalg.norm(tl - bl)
-    maxH = int(max(heightA, heightB))
-    dst = np.array([
-        [0, 0],
-        [maxW - 1, 0],
-        [maxW - 1, maxH - 1],
-        [0, maxH - 1]], dtype="float32")
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxW, maxH))
-    return warped
-
-def auto_crop_border(bw_np: np.ndarray, pad: int = 6) -> np.ndarray:
-    # Entfernt weiße Ränder: finde Bounding Box aller „schwarzen“ Pixel
-    # bw_np ist 0/255
-    mask = (bw_np < 250).astype(np.uint8)  # alles was nicht fast weiß ist
-    coords = np.column_stack(np.where(mask > 0))
-    if coords.size == 0:
-        return bw_np  # nichts gefunden
-    y_min, x_min = coords.min(axis=0)
-    y_max, x_max = coords.max(axis=0)
-    y_min = max(0, y_min - pad); x_min = max(0, x_min - pad)
-    y_max = min(bw_np.shape[0]-1, y_max + pad); x_max = min(bw_np.shape[1]-1, x_max + pad)
-    return bw_np[y_min:y_max+1, x_min:x_max+1]
-
-def cv2_scan(img_pil: Image.Image) -> Image.Image:
-    """
-    Voller OpenCV-Pipeline-Scan:
-    - Kanten finden
-    - größtes 4-Eck (Dokument) wählen
-    - Perspektive entzerren
-    - adaptives Threshold (Scan-Look)
-    - Rand automatisch croppen
-    Fallback: falls 4-Eck nicht gefunden → nur B/W.
-    """
-    if not HAS_CV2:
-        return enhance_and_binarize_pil(img_pil)
-
-    # PIL → OpenCV (BGR)
-    img = np.array(img_pil.convert("RGB"))
-    img = img[:, :, ::-1]  # RGB → BGR
-
-    # kleiner Vorschau-Frame für robustere Konturen
-    h, w = img.shape[:2]
-    scale = 800.0 / max(h, w)
-    scale = min(1.0, scale)
-    small = cv2.resize(img, (int(w*scale), int(h*scale)))
-    ratio = 1.0 / scale
-
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # Kanten → Konturen
-    edges = cv2.Canny(gray, 60, 160)
-    edges = cv2.dilate(edges, None, iterations=1)
-    edges = cv2.erode(edges, None, iterations=1)
-
-    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
-
-    screenCnt = None
-    for c in cnts[:10]:
+    for c in cnts:
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            screenCnt = approx.reshape(4, 2) * ratio
-            break
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            area = cv2.contourArea(approx)
+            # zu kleine Flächen ignorieren
+            if area > best_area and area > 0.15 * (h * w):
+                best = approx
+                best_area = area
 
-    if screenCnt is None:
-        # kein sauberes 4‑Eck gefunden → Fallback
-        return enhance_and_binarize_pil(img_pil)
+    if best is None:
+        return None
 
-    # Perspektive entzerren (auf Originalgröße)
-    warped = four_point_transform(img, screenCnt.astype("float32"))
-    warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    quad = best.reshape(4, 2).astype(np.float32)
+    # sortiere Punkte: tl, tr, br, bl
+    s = quad.sum(axis=1)
+    diff = np.diff(quad, axis=1).ravel()
+    tl = quad[np.argmin(s)]
+    br = quad[np.argmax(s)]
+    tr = quad[np.argmin(diff)]
+    bl = quad[np.argmax(diff)]
+    return np.array([tl, tr, br, bl], dtype=np.float32)
 
-    # adaptives Threshold → „Scan“-Look
-    bw = cv2.adaptiveThreshold(
-        warped_gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31, 10
+def four_point_transform(img: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    (tl, tr, br, bl) = pts
+    # Seitenlängen
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    maxWidth = int(max(widthA, widthB))
+
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxHeight = int(max(heightA, heightB))
+
+    dst = np.array(
+        [[0, 0],
+         [maxWidth - 1, 0],
+         [maxWidth - 1, maxHeight - 1],
+         [0, maxHeight - 1]], dtype=np.float32
     )
+    M = cv2.getPerspectiveTransform(pts, dst)
+    warped = cv2.warpPerspective(img, M, (maxWidth, maxHeight), flags=cv2.INTER_CUBIC)
+    return warped
 
-    # Auto-Cropping von weißen Rändern
-    bw = auto_crop_border(bw, pad=8)
+def fallback_crop(mat_gray: np.ndarray) -> np.ndarray:
+    # Minimaler Fallback: größtes Rotationsrechteck + Rand
+    thresh = cv2.adaptiveThreshold(mat_gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY_INV, 41, 10)
+    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return mat_gray
+    big = max(cnts, key=cv2.contourArea)
+    rect = cv2.minAreaRect(big)  # (center,(w,h),angle)
+    box = cv2.boxPoints(rect).astype(np.float32)
+    warped = four_point_transform(mat_gray, order_quad(box))
+    # leichter Rand weg
+    h, w = warped.shape[:2]
+    y0 = max(0, int(0.02 * h)); y1 = int(0.98 * h)
+    x0 = max(0, int(0.04 * w)); x1 = int(0.96 * w)
+    return warped[y0:y1, x0:x1]
 
-    # Zurück nach PIL
-    result = Image.fromarray(bw)
-    return result
+def order_quad(quad: np.ndarray) -> np.ndarray:
+    s = quad.sum(axis=1)
+    diff = np.diff(quad, axis=1).ravel()
+    tl = quad[np.argmin(s)]
+    br = quad[np.argmax(s)]
+    tr = quad[np.argmin(diff)]
+    bl = quad[np.argmax(diff)]
+    return np.array([tl, tr, br, bl], dtype=np.float32)
 
-# ------------------------------------------------------------
-# PDF-Erstellung
-# ------------------------------------------------------------
+def deskew_to_portrait(img_gray: np.ndarray) -> np.ndarray:
+    # binär für Winkelbestimmung
+    bw = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    coords = np.column_stack(np.where(bw == 0))  # schwarze Pixel
+    if len(coords) < 100:
+        return img_gray
+    angle = cv2.minAreaRect(coords)[-1]
+    # OpenCV: Winkel liegt in [-90,0)
+    if angle < -45:
+        angle = 90 + angle
+    M = cv2.getRotationMatrix2D((img_gray.shape[1]//2, img_gray.shape[0]//2), angle, 1.0)
+    rotated = cv2.warpAffine(img_gray, M, (img_gray.shape[1], img_gray.shape[0]),
+                             flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    # auf Portrait drehen
+    h, w = rotated.shape[:2]
+    if w > h:
+        rotated = cv2.rotate(rotated, cv2.ROTATE_90_CLOCKWISE)
+    return rotated
 
-def make_pdf_from_image(img: Image.Image) -> bytes:
-    """
-    Legt das Bild mittig auf eine A4-Seite. (Kein Upscaling über A4 hinaus)
-    """
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    a4_w, a4_h = A4
+def sauvola_binarize(img_gray: np.ndarray) -> np.ndarray:
+    # Sauvola via OpenCV: nehmen wir adaptiveGaussian als Näherung und verstärken Kontrast
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    eq = clahe.apply(img_gray)
+    bw = cv2.adaptiveThreshold(eq, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 31, 12)
+    return bw
 
-    img_bytes = io.BytesIO()
-    # Für „saubere“ Kanten im PDF: als PNG speichern
-    img.save(img_bytes, format="PNG")
-    img_bytes.seek(0)
+def add_margin(img: np.ndarray, px: int = 24) -> np.ndarray:
+    return cv2.copyMakeBorder(img, px, px, px, px, cv2.BORDER_CONSTANT, value=255)
 
-    iw, ih = img.size
-    ratio = min(a4_w / iw, a4_h / ih)
-    new_w, new_h = iw * ratio, ih * ratio
-    x = (a4_w - new_w) / 2
-    y = (a4_h - new_h) / 2
+def make_pdf(bw_img: np.ndarray, filename: str = "scan.pdf") -> bytes:
+    # PDF-Seitengröße passend zum Bild (72 dpi = pt): wir setzen ~ 96 dpi Skalierung für bessere Schärfe
+    h, w = bw_img.shape[:2]
+    dpi = 96.0
+    page_w = w * 72.0 / dpi
+    page_h = h * 72.0 / dpi
 
-    c.drawImage(ImageReader(img_bytes), x, y, width=new_w, height=new_h, preserveAspectRatio=True, mask="auto")
+    buff = io.BytesIO()
+    c = canvas.Canvas(buff, pagesize=(page_w, page_h))
+    # als PNG in Memory für ImageReader
+    png_bytes = cv2.imencode(".png", bw_img)[1].tobytes()
+    img_ir = ImageReader(io.BytesIO(png_bytes))
+    c.drawImage(img_ir, 0, 0, width=page_w, height=page_h)
     c.showPage()
     c.save()
-    return buf.getvalue()
+    return buff.getvalue()
 
-# ------------------------------------------------------------
-# Endpoint
-# ------------------------------------------------------------
+# ------------------------- Pipeline -------------------------
 
-@app.get("/")
-def root():
-    return {"ok": True, "msg": "Use /scan?file_url=... (returns PDF)"}
+def process_image_to_bw(mat_bgr: np.ndarray) -> np.ndarray:
+    # 1) Resize
+    mat_bgr = ensure_max_side(mat_bgr, 2400)
+
+    # 2) QR maskieren
+    mat_bgr = mask_qr(mat_bgr)
+
+    # 3) Graustufen
+    gray = cv2.cvtColor(mat_bgr, cv2.COLOR_BGR2GRAY)
+
+    # 4) Dokument finden
+    quad = find_doc_quad(gray)
+    if quad is not None:
+        warped = four_point_transform(gray, quad)
+    else:
+        warped = fallback_crop(gray)
+
+    # 5) Begradigen & Portrait
+    warped = deskew_to_portrait(warped)
+
+    # 6) Binarisieren
+    bw = sauvola_binarize(warped)
+
+    # 7) leichter Rand
+    bw = add_margin(bw, 18)
+
+    return bw
+
+# ------------------------- Routes -------------------------
+
+@app.get("/", response_class=PlainTextResponse)
+async def root():
+    return "OK"
 
 @app.get("/scan")
-async def scan(
-    file_url: str = Query(..., description="Direkter Link zur Bild- oder PDF-Datei"),
-    response: str = Query("pdf", description="'pdf' für direkte Datei-Ausgabe")
-):
-    raw, ctype = await fetch_bytes(file_url)
+async def scan(file_url: str):
+    """
+    Beispiel:
+      GET /scan?file_url=https://.../bild.jpg
+    Antwort:
+      application/pdf (Dateistream), Content-Disposition: attachment; filename=scan.pdf
+    """
+    # 1) Bild bytes holen
+    img_bytes = await fetch_image_bytes(file_url)
 
-    # Wenn bereits PDF: einfach durchreichen (keine Bildverbesserung)
-    if looks_like_pdf(ctype, raw):
-        pdf_bytes = raw
-    else:
-        # Bild laden + EXIF-Rotation korrigieren
-        img = Image.open(io.BytesIO(raw))
-        img = exif_transpose(img)
+    # 2) PIL laden
+    try:
+        pil = Image.open(io.BytesIO(img_bytes))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Ungültiges Bildformat: {e}")
 
-        # Querformat → optional automatisch drehen, damit Hochformat bevorzugt ist
-        if img.width > img.height:
-            img = img.rotate(90, expand=True)
+    # 3) PIL -> OpenCV
+    mat = pil_to_cv2(pil)
+    if mat is None:
+        raise HTTPException(status_code=400, detail="Bildkonvertierung fehlgeschlagen.")
 
-        # OpenCV-Pipeline (mit Fallback)
-        scanned = cv2_scan(img)
-        pdf_bytes = make_pdf_from_image(scanned)
+    # 4) Pipeline
+    try:
+        bw = process_image_to_bw(mat)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Verarbeitung fehlgeschlagen: {e}")
 
-    # Immer PDF direkt zurückgeben
-    return StreamingResponse(
-        io.BytesIO(pdf_bytes),
-        media_type="application/pdf",
-        headers={"Content-Disposition": 'inline; filename="scan.pdf"'}
-    )
+    # 5) PDF bauen
+    try:
+        pdf_bytes = make_pdf(bw, "scan.pdf")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF-Erzeugung fehlgeschlagen: {e}")
+
+    headers = {
+        "Content-Disposition": 'attachment; filename="scan.pdf"'
+    }
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
