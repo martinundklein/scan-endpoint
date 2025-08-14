@@ -1,265 +1,254 @@
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import Response, PlainTextResponse
-import httpx, io, math
+from fastapi import FastAPI, Query, Response, HTTPException
+import httpx, io, math, os
 import numpy as np
 import cv2 as cv
-from PIL import Image, ImageFilter
-from reportlab.lib.pagesizes import letter
+from PIL import Image
 from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 
-app = FastAPI(title="Scan Endpoint", version="1.0")
+app = FastAPI(title="Scan Endpoint", version="1.0.0")
 
-# ---------- kleine Hilfen ----------
+# -------- Helpers --------
 
-def url_to_image_bytes(url: str) -> bytes:
-    timeout = httpx.Timeout(30.0, connect=10.0)
+async def fetch_image(url: str, timeout_s: float = 25.0) -> np.ndarray:
     headers = {"User-Agent": "scan-endpoint/1.0"}
-    with httpx.Client(timeout=timeout, follow_redirects=True, headers=headers) as client:
-        r = client.get(url)
-        if r.status_code != 200 or not r.content:
-            raise HTTPException(502, detail=f"Fehler beim Laden: HTTP {r.status_code}")
-        return r.content
+    limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+    async with httpx.AsyncClient(headers=headers, timeout=timeout_s, limits=limits, follow_redirects=True) as client:
+        last_err = None
+        for _ in range(3):
+            try:
+                r = await client.get(url)
+                r.raise_for_status()
+                data = np.frombuffer(r.content, np.uint8)
+                img = cv.imdecode(data, cv.IMREAD_COLOR)
+                if img is None:
+                    raise ValueError("Konnte Bild nicht dekodieren")
+                return img
+            except Exception as e:
+                last_err = e
+        raise HTTPException(status_code=400, detail=f"Download/Decode fehlgeschlagen: {last_err}")
 
-def imread_from_bytes(b: bytes) -> np.ndarray:
-    arr = np.frombuffer(b, np.uint8)
-    img = cv.imdecode(arr, cv.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(400, detail="Bild konnte nicht dekodiert werden")
-    return img
+def to_gray(img_bgr: np.ndarray) -> np.ndarray:
+    if len(img_bgr.shape) == 2:
+        return img_bgr
+    return cv.cvtColor(img_bgr, cv.COLOR_BGR2GRAY)
 
-def to_pil(img_bgr: np.ndarray) -> Image.Image:
-    return Image.fromarray(cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB))
-
-def to_bgr(img_pil: Image.Image) -> np.ndarray:
-    return cv.cvtColor(np.array(img_pil), cv.COLOR_RGB2BGR)
-
-# ---------- Vorverarbeitung / „Scanlook“ ----------
-
-def white_balance_grayworld(img: np.ndarray) -> np.ndarray:
-    # robust & billig
-    b, g, r = cv.split(img.astype(np.float32))
-    mb, mg, mr = [x.mean() for x in (b, g, r)]
-    k = (mb + mg + mr) / 3.0 + 1e-6
-    b *= k / mb; g *= k / mg; r *= k / mr
-    out = cv.merge([b, g, r])
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-def soft_binarize(gray: np.ndarray) -> np.ndarray:
-    # adaptive, aber „soft“ gemischt mit Graustufen – verhindert harte Ausfransungen
-    # 1) lokale Kontrastverstärkung
-    clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    g1 = clahe.apply(gray)
-    # 2) leichte Glättung
-    g2 = cv.bilateralFilter(g1, d=5, sigmaColor=25, sigmaSpace=25)
-    # 3) adaptive Schwelle
-    th = cv.adaptiveThreshold(g2, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-                              cv.THRESH_BINARY, 31, 10)
-    # 4) „weiche“ Mischung (0.65 binär / 0.35 grau)
-    mixed = (0.65 * th + 0.35 * g2).astype(np.uint8)
-    return mixed
-
-def unsharp_mask(pil_img: Image.Image, radius=1.2, amount=1.4) -> Image.Image:
-    # klassisches Unsharp – gute Lesbarkeit bei Text
-    return pil_img.filter(ImageFilter.UnsharpMask(radius=radius, percent=int(amount*100), threshold=2))
-
-# ---------- Belegsuche (mit QR-Ignorierung) ----------
-
-def find_receipt_quad(img: np.ndarray, min_conf=0.7):
-    h, w = img.shape[:2]
-    gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-    gray = cv.GaussianBlur(gray, (5,5), 0)
-
+def deskew_small_angles(gray: np.ndarray) -> np.ndarray:
+    # Nur leichte Schiefstellung korrigieren (max ~5°)
     edges = cv.Canny(gray, 50, 150)
-    edges = cv.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
-    contours, _ = cv.findContours(edges, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    lines = cv.HoughLines(edges, 1, np.pi/180, threshold=120)
+    if lines is None:
+        return gray
+    angles = []
+    for rho, theta in lines[:,0]:
+        a = theta
+        # nur nahe 0°/180° oder 90° berücksichtigen
+        deg = (a * 180.0 / math.pi) % 180.0
+        if deg < 10 or abs(deg-90) < 10 or abs(deg-180) < 10:
+            # Winkel normalisieren auf -90..90
+            ang = deg if deg <= 90 else deg-180
+            angles.append(ang)
+    if not angles:
+        return gray
+    median_angle = float(np.median(angles))
+    if abs(median_angle) < 0.5:
+        return gray
+    if abs(median_angle) > 5:
+        median_angle = 5.0 if median_angle > 0 else -5.0
+    (h, w) = gray.shape[:2]
+    M = cv.getRotationMatrix2D((w/2, h/2), median_angle, 1.0)
+    rotated = cv.warpAffine(gray, M, (w, h), flags=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE)
+    return rotated
 
+def detect_document_polygon(gray: np.ndarray):
+    # Kanten -> Konturen -> bestes 4‑Eck
+    h, w = gray.shape
+    blur = cv.GaussianBlur(gray, (5,5), 0)
+    edges = cv.Canny(blur, 50, 150)
+    # QR-Code stört oft: Kleine Quadrate filtern wir später raus
+    cnts, _ = cv.findContours(edges, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    img_area = float(h*w)
     best = None
     best_score = 0.0
-
-    for c in contours:
+    for c in cnts:
         area = cv.contourArea(c)
-        if area < (w*h)*0.03:  # zu klein
+        if area < img_area * 0.05:  # ignoriere sehr kleine Konturen
             continue
-        # QR-ähnliche Quadrate rausfiltern
-        rect = cv.minAreaRect(c)
-        (cx, cy), (rw, rh), angle = rect
-        ar = min(rw, rh) / (max(rw, rh) + 1e-6)
-        if 0.80 < ar < 1.20 and area < (w*h)*0.25:
-            # ziemliches Quadrat und nicht sehr groß -> sehr wahrscheinlich QR/Sticker
-            continue
-
         peri = cv.arcLength(c, True)
         approx = cv.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4 and cv.isContourConvex(approx):
-            # Score: Größe * Seitenverhältnis „Beleg-typisch“ (sehr hochkant)
-            poly = approx.reshape(4,2).astype(np.float32)
-            rect2 = cv.minAreaRect(approx)
-            (rw, rh) = rect2[1]
-            tall = max(rw, rh) / (min(rw, rh) + 1e-6)  # >=1
-            score = (area/(w*h)) * (min(tall/2.5, 1.0))  # tall ~ 2.5 begünstigen
-            if score > best_score:
-                best_score = score
-                best = poly
+        if len(approx) != 4:
+            continue
+        rect = cv.minAreaRect(approx)
+        (rw, rh) = rect[1]
+        if rw == 0 or rh == 0:
+            continue
+        aspect = max(rw, rh) / (min(rw, rh) + 1e-6)
+        # Filtere nahezu quadratische, kleine Flächen (typisch QR):
+        if 0.85 <= aspect <= 1.15 and area < img_area * 0.25:
+            continue
+        # Score: Flächenanteil * rechteckige Qualität
+        area_ratio = area / img_area
+        score = area_ratio
+        if score > best_score:
+            best_score = score
+            best = approx
+    return best, float(best_score)
 
-    conf = float(min(best_score*1.4, 1.0))  # grobe Normierung
-    return best, conf
+def order_corners(pts: np.ndarray):
+    pts = pts.reshape(4,2).astype(np.float32)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).reshape(4)
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmin(diff)]
+    bl = pts[np.argmax(diff)]
+    return np.array([tl, tr, bl, br], dtype=np.float32)
 
-def four_point_warp(img: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    # sort points
-    rect = np.zeros((4,2), dtype=np.float32)
-    s = pts.sum(axis=1); rect[0] = pts[np.argmin(s)]  # tl
-    rect[2] = pts[np.argmax(s)]  # br
-    diff = np.diff(pts, axis=1).ravel()
-    rect[1] = pts[np.argmin(diff)]  # tr
-    rect[3] = pts[np.argmax(diff)]  # bl
+def warp_to_topdown(src_bgr: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    h, w = src_bgr.shape[:2]
+    pts = order_corners(quad)
+    (tl, tr, bl, br) = pts
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxW = int(max(widthA, widthB))
+    maxH = int(max(heightA, heightB))
+    maxW = max(100, maxW)
+    maxH = max(100, maxH)
+    dst = np.array([[0,0],[maxW-1,0],[0,maxH-1],[maxW-1,maxH-1]], dtype=np.float32)
+    M = cv.getPerspectiveTransform(pts, dst)
+    return cv.warpPerspective(src_bgr, M, (maxW, maxH), flags=cv.INTER_CUBIC)
 
-    (tl, tr, br, bl) = rect
-    wA = np.linalg.norm(br-bl); wB = np.linalg.norm(tr-tl)
-    hA = np.linalg.norm(tr-br); hB = np.linalg.norm(tl-bl)
-    maxW = int(max(wA, wB)); maxH = int(max(hA, hB))
-    maxW = max(200, maxW); maxH = max(200, maxH)
+def bw_scan(gray: np.ndarray, strength: float = 0.85) -> np.ndarray:
+    # CLAHE für Kontrast
+    clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    g = clahe.apply(gray)
+    # adaptive Threshold (Blockgröße abhängig von Bildbreite)
+    h, w = g.shape
+    block = int(max(31, (min(h, w) // 30) | 1))  # ungerade
+    th = cv.adaptiveThreshold(g, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+                              cv.THRESH_BINARY, block, 7)
+    # sanfte Mischung mit Graustufe, um "zu hart" zu vermeiden
+    mixed = cv.addWeighted(th, strength, g, 1.0 - strength, 0)
+    return mixed
 
-    dst = np.array([[0,0],[maxW-1,0],[maxW-1,maxH-1],[0,maxH-1]], dtype=np.float32)
-    M = cv.getPerspectiveTransform(rect, dst)
-    warped = cv.warpPerspective(img, M, (maxW, maxH), flags=cv.INTER_CUBIC)
-    return warped
+def upscale_if_needed(img: np.ndarray, mode: str = "auto") -> np.ndarray:
+    if mode not in ("auto","off"):
+        mode = "auto"
+    if mode == "off":
+        return img
+    h, w = img.shape[:2]
+    long = max(h, w)
+    if long >= 1600:
+        return img
+    scale = 1600.0 / long
+    new = (int(w*scale), int(h*scale))
+    return cv.resize(img, new, interpolation=cv.INTER_CUBIC)
 
-# ---------- Upscaling ----------
+def make_pdf_from_image(pil_img: Image.Image, max_kb: int, hard_cap_kb: int) -> bytes:
+    # 1) zu Graustufe, moderate Zielgröße
+    pil = pil_img.convert("L")
+    max_long = 1600
+    w, h = pil.size
+    long_side = max(w, h)
+    if long_side > max_long:
+        scale = max_long / float(long_side)
+        pil = pil.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
 
-def maybe_upscale_for_text(img_bgr: np.ndarray, mode: str = "auto") -> np.ndarray:
-    if mode == "none":
-        return img_bgr
-
-    h, w = img_bgr.shape[:2]
-    shorter = min(h, w)
-    # heuristik: unter 900 px -> hochskalieren
-    if mode in ("auto", "fast") and shorter < 900:
-        scale = 2.0 if shorter < 700 else 1.5
-        new_size = (int(w*scale), int(h*scale))
-        up = cv.resize(img_bgr, new_size, interpolation=cv.INTER_LANCZOS4)
-        return up
-
-    if mode == "sr":
-        # Optional: DNN Super-Resolution, falls Modelle vorhanden
-        try:
-            from cv2.dnn_superres import DnnSuperResImpl_create
-            sr = DnnSuperResImpl_create()
-            # Beispiel: ESPCN x2 (schnell), lade modelldatei aus /app/models/
-            sr.readModel("/app/models/ESPCN_x2.pb")
-            sr.setModel("espcn", 2)
-            up = sr.upsample(img_bgr)
-            return up
-        except Exception:
-            # Fallback
-            return maybe_upscale_for_text(img_bgr, "fast")
-
-    return img_bgr
-
-# ---------- PDF-Erzeugung mit Größenlimit ----------
-
-def make_pdf_bytes(img_bgr: np.ndarray, target_kb: int = 600, hard_cap_kb: int = 800) -> bytes:
-    # Wir betten ein JPEG (Graustufen) in die PDF & schrauben Qualität bis unter Zielgröße
-    # 1) nach PIL & Graustufen
-    pil = to_pil(img_bgr).convert("L")
-
-    def jpeg_bytes(quality: int) -> bytes:
+    # 2) JPEG-Qualitätsschleife + ggf. Downscale
+    quality = 75
+    data = None
+    for _ in range(8):
         buf = io.BytesIO()
         pil.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
-        return buf.getvalue()
+        jpg = buf.getvalue()
+        if len(jpg) <= max_kb * 1024:
+            data = jpg
+            break
+        # sonst: Qualität runter, dann ggf. kippe noch die Größe
+        if quality > 45:
+            quality -= 8
+        else:
+            # verkleinere 10%
+            w, h = pil.size
+            pil = pil.resize((int(w*0.9), int(h*0.9)), Image.LANCZOS)
+    if data is None:
+        data = jpg
+        if len(data) > hard_cap_kb * 1024:
+            # letzter Rettungsanker: noch kleiner
+            w, h = pil.size
+            pil = pil.resize((max(600, int(w*0.85)), max(600, int(h*0.85))), Image.LANCZOS)
+            buf = io.BytesIO()
+            pil.save(buf, format="JPEG", quality=42, optimize=True, progressive=True)
+            data = buf.getvalue()
 
-    # Quality-Schleife: Start 75 → runter
-    q = 75
-    jpg = jpeg_bytes(q)
-    while len(jpg) > target_kb*1024 and q > 35:
-        q -= 5
-        jpg = jpeg_bytes(q)
+    # 3) in PDF einbetten (Seite auf Bildgröße, zentriert auf A4)
+    img_reader = ImageReader(io.BytesIO(data))
+    a4_w, a4_h = A4
+    # Bildgröße in Punkten (bei 72dpi: 1px ~ 0.75pt). Wir nehmen dynamisch: skaliere so, dass es breit passt.
+    with Image.open(io.BytesIO(data)) as tmp:
+        iw, ih = tmp.size
+    # target Breite = 500pt – 540pt (optisch), aber wenn hochkant sehr lang: auf A4 Breite
+    max_pt_w = a4_w - 60
+    scale = min(max_pt_w / iw, (a4_h - 60) / ih)
+    pw, ph = iw * scale, ih * scale
+    # PDF bauen
+    out = io.BytesIO()
+    c = canvas.Canvas(out, pagesize=A4)
+    x = (a4_w - pw) / 2
+    y = (a4_h - ph) / 2
+    c.drawImage(img_reader, x, y, pw, ph, preserveAspectRatio=True, mask='auto')
+    c.showPage()
+    c.save()
+    return out.getvalue()
 
-    # notfalls hard cap
-    if len(jpg) > hard_cap_kb*1024:
-        while len(jpg) > hard_cap_kb*1024 and q > 25:
-            q -= 3
-            jpg = jpeg_bytes(q)
+def np_to_pil(arr: np.ndarray) -> Image.Image:
+    if len(arr.shape) == 2:
+        return Image.fromarray(arr)
+    return Image.fromarray(cv.cvtColor(arr, cv.COLOR_BGR2RGB))
 
-    # 2) PDF
-    img_reader = ImageReader(io.BytesIO(jpg))
-    # setze Seitenmaß so, dass DPI um 150–170 liegt
-    wpx, hpx = pil.size
-    dpi = 160.0
-    pw, ph = (wpx / dpi * 72.0, hpx / dpi * 72.0)  # PDF-Punkte
-    pdf_buf = io.BytesIO()
-    c = canvas.Canvas(pdf_buf, pagesize=(pw, ph))
-    c.drawImage(img_reader, 0, 0, width=pw, height=ph, preserveAspectRatio=True, mask='auto')
-    c.showPage(); c.save()
-    return pdf_buf.getvalue()
+# -------- Routes --------
 
-# ---------- Hauptpipeline ----------
-
-def process_pipeline(img_bgr: np.ndarray,
-                     crop_conf: float = 0.7,
-                     upscale_mode: str = "auto",
-                     bw_strength: float = 0.8) -> np.ndarray:
-    # 0) Weißabgleich + milde Denoise
-    img = white_balance_grayworld(img_bgr)
-    img = cv.fastNlMeansDenoisingColored(img, None, 3, 3, 7, 21)
-
-    # 1) evtl. Upscaling
-    img = maybe_upscale_for_text(img, mode=upscale_mode)
-
-    # 2) sichere Belegsuche
-    quad, conf = find_receipt_quad(img, min_conf=crop_conf)
-    if quad is not None and conf >= crop_conf:
-        img = four_point_warp(img, quad)
-
-    # 3) „Scanlook“ (grau/bw gemischt) + sanfte Schärfung
-    gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-    bw = soft_binarize(gray)
-
-    # Mischung steuern
-    bw = (bw_strength * bw + (1.0 - bw_strength) * gray).astype(np.uint8)
-
-    pil = Image.fromarray(bw)
-    pil = unsharp_mask(pil, radius=1.0, amount=1.1)  # moderat
-    out = cv.cvtColor(np.array(pil), cv.COLOR_GRAY2BGR)
-    return out
-
-# ---------- Routes ----------
-
-@app.get("/", response_class=PlainTextResponse)
-def root():
-    return "OK"
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "scan-endpoint", "version": "1.0.0"}
 
 @app.get("/scan")
-def scan(
-    file_url: str = Query(..., description="Direkter Bild-URL (JPG/PNG)"),
-    max_kb: int = Query(600, ge=60, le=2000, description="Zielgröße PDF in KB (soft)"),
-    hard_cap_kb: int = Query(800, ge=80, le=4000, description="harte Obergrenze PDF in KB"),
-    crop_conf: float = Query(0.70, ge=0.0, le=1.0, description="Sicherheit für Zuschneiden/Begradigen"),
-    upscale: str = Query("auto", regex="^(auto|fast|sr|none)$", description="Upscaling-Modus"),
-    bw_strength: float = Query(0.80, ge=0.4, le=1.0, description="0.4=graulastig … 1.0=sehr hart schwarz/weiß"),
-    filename: str = Query("scan.pdf")
+async def scan(
+    file_url: str = Query(..., description="Direkte Bild-URL (JPG/PNG…)"),
+    filename: str = Query("scan.pdf"),
+    crop_conf: float = Query(0.70, ge=0.0, le=1.0),
+    bw_strength: float = Query(0.85, ge=0.4, le=1.0),
+    max_kb: int = Query(600, ge=60, le=4000),
+    hard_cap_kb: int = Query(900, ge=80, le=8000),
+    upscale: str = Query("auto", description="'auto' oder 'off'"),
 ):
-    """
-    Lädt ein Bild, macht daraus einen gut lesbaren „Scan“-PDF
-    - Zuschneiden/Begradigen nur bei sicherer Erkennung (crop_conf)
-    - QR-Codes werden bei der Kontursuche ignoriert
-    - Optionales Upscaling für kleine/quellige Fotos
-    - PDF-Größe wird automatisch unter das Ziel gedrückt
-    """
-    raw = url_to_image_bytes(file_url)
-    img = imread_from_bytes(raw)
-
-    out = process_pipeline(
-        img_bgr=img,
-        crop_conf=crop_conf,
-        upscale_mode=upscale,
-        bw_strength=bw_strength
-    )
-
-    pdf_bytes = make_pdf_bytes(out, target_kb=max_kb, hard_cap_kb=hard_cap_kb)
+    # 1) Download
+    bgr = await fetch_image(file_url)
+    # 2) ggf. Upscale
+    bgr = upscale_if_needed(bgr, mode=upscale)
+    # 3) Grund-Graustufe + leichte Deskew
+    gray = to_gray(bgr)
+    gray = deskew_small_angles(gray)
+    # 4) Dokumentenerkennung (nur wenn sicher)
+    quad, score = detect_document_polygon(gray)
+    if quad is not None and score >= crop_conf:
+        try:
+            bgr = warp_to_topdown(cv.cvtColor(gray, cv.COLOR_GRAY2BGR), quad)
+            gray = to_gray(bgr)
+        except Exception:
+            # Falls Warp scheitert: ignorieren
+            pass
+    # 5) B/W-Scan (schonend)
+    bw = bw_scan(gray, strength=bw_strength)
+    pil = np_to_pil(bw)
+    # 6) PDF erzeugen + Komprimieren
+    pdf_bytes = make_pdf_from_image(pil, max_kb=max_kb, hard_cap_kb=hard_cap_kb)
 
     headers = {
         "Content-Disposition": f'inline; filename="{filename}"',
-        "Cache-Control": "no-store"
+        "Cache-Control": "no-store",
     }
     return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
